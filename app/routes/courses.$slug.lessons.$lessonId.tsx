@@ -17,12 +17,14 @@ import {
 } from "~/components/comment-thread";
 import { db } from "~/db";
 import {
+  bookmarks,
   categories,
   comments,
   courses,
   lessonProgress,
   lessons,
   modules,
+  notes,
   quizzes,
   quizQuestions,
   quizOptions,
@@ -36,6 +38,7 @@ import {
 import { and, asc, desc, eq, or, sql } from "drizzle-orm";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent } from "~/components/ui/card";
+import { Textarea } from "~/components/ui/textarea";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -44,8 +47,11 @@ import {
   ChevronRight,
   Circle,
   Clock,
+  Bookmark,
+  BookmarkCheck,
   Github,
   HelpCircle,
+  NotebookPen,
   MapPin,
   PlayCircle,
   ShieldAlert,
@@ -81,6 +87,15 @@ const editCommentSchema = z.object({
   commentId: z.coerce.number().int(),
   body: z.string(),
 });
+
+const noteCharacterLimit = 5000;
+const savedLessonSchema = z.discriminatedUnion("intent", [
+  z.object({ intent: z.literal("toggle-bookmark") }),
+  z.object({
+    intent: z.literal("save-note"),
+    body: z.string().trim().max(noteCharacterLimit),
+  }),
+]);
 
 const deleteCommentSchema = z.object({
   intent: z.literal("delete-comment"),
@@ -271,6 +286,40 @@ function markLessonInProgress(userId: number, lessonId: number) {
     })
     .returning()
     .get();
+}
+
+type StudentLesson = Pick<typeof bookmarks.$inferInsert, "userId" | "lessonId">;
+
+function bookmarkFor({ userId, lessonId }: StudentLesson) {
+  return and(eq(bookmarks.userId, userId), eq(bookmarks.lessonId, lessonId));
+}
+
+function noteFor({ userId, lessonId }: StudentLesson) {
+  return and(eq(notes.userId, userId), eq(notes.lessonId, lessonId));
+}
+
+function toggleBookmark(studentLesson: StudentLesson) {
+  db.transaction((tx) => {
+    const removed = tx.delete(bookmarks).where(bookmarkFor(studentLesson)).run();
+    if (removed.changes === 0) {
+      tx.insert(bookmarks).values(studentLesson).run();
+    }
+  });
+}
+
+function saveNote(studentLesson: StudentLesson, body: string) {
+  if (!body) {
+    db.delete(notes).where(noteFor(studentLesson)).run();
+    return;
+  }
+
+  db.insert(notes)
+    .values({ ...studentLesson, body })
+    .onConflictDoUpdate({
+      target: [notes.userId, notes.lessonId],
+      set: { body, updatedAt: new Date().toISOString() },
+    })
+    .run();
 }
 
 function getLastWatchPosition(userId: number, lessonId: number) {
@@ -689,6 +738,17 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     ? await renderThread(getLessonThread(lessonId))
     : [];
 
+  const studentLesson =
+    currentUserId && access.user?.role === UserRole.Student && enrolled && canViewContent
+      ? { userId: currentUserId, lessonId }
+      : null;
+  const bookmarked = studentLesson
+    ? Boolean(db.select({ id: bookmarks.id }).from(bookmarks).where(bookmarkFor(studentLesson)).get())
+    : false;
+  const note = studentLesson
+    ? db.select({ body: notes.body }).from(notes).where(noteFor(studentLesson)).get()
+    : null;
+
   // Render lesson content from Markdown to HTML server-side
   const contentHtml = lesson.content
     ? await renderMarkdown(lesson.content)
@@ -783,6 +843,9 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     canViewContent,
     canModerate: access.isStaff,
     instructorName: instructor?.name ?? "your instructor",
+    canSaveLesson: Boolean(studentLesson),
+    bookmarked,
+    note: note?.body ?? "",
   };
 }
 
@@ -880,6 +943,29 @@ export async function action({ params, request }: Route.ActionArgs) {
     }
   }
 
+  if (intent === "toggle-bookmark" || intent === "save-note") {
+    const parsed = parseFormData(formData, savedLessonSchema);
+    if (!parsed.success) {
+      throw data("Invalid bookmark or note submission.", { status: 400 });
+    }
+    const access = await requireContentAccess(request, course.id);
+    if (!access.enrolled || access.user?.role !== UserRole.Student) {
+      throw data("Only enrolled students can save lessons.", { status: 403 });
+    }
+    const lesson = getLessonById(lessonId);
+    if (!lesson || getModuleById(lesson.moduleId)?.courseId !== course.id) {
+      throw data("Lesson not found in this course", { status: 404 });
+    }
+
+    const studentLesson = { userId: currentUserId, lessonId };
+    if (parsed.data.intent === "toggle-bookmark") {
+      toggleBookmark(studentLesson);
+    } else {
+      saveNote(studentLesson, parsed.data.body);
+    }
+    return { ok: true };
+  }
+
   if (intent === "mark-complete") {
     markLessonComplete(currentUserId, lessonId);
     return { success: true };
@@ -966,6 +1052,9 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
     canViewContent,
     canModerate,
     instructorName,
+    canSaveLesson,
+    bookmarked,
+    note,
   } = loaderData;
   const [autoplay, toggleAutoplay] = useAutoplay();
   const fetcher = useFetcher({ key: `mark-complete-${lesson.id}` });
@@ -1074,6 +1163,9 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
                 {formatDuration(lesson.durationMinutes, true, false, false)}
               </div>
             )}
+            {canSaveLesson && (
+              <BookmarkToggle bookmarked={bookmarked} />
+            )}
             {lesson.githubRepoUrl && (
               <a
                 href={lesson.githubRepoUrl}
@@ -1118,6 +1210,9 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
               </CardContent>
             </Card>
           )}
+
+          {/* Notes */}
+          {canSaveLesson && <LessonNote key={`${currentUserId}-${lesson.id}`} note={note} />}
 
           {/* Quiz Section */}
           {quiz && enrolled && currentUserId && (
@@ -1237,6 +1332,58 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+function BookmarkToggle({ bookmarked }: { bookmarked: boolean }) {
+  const fetcher = useFetcher<{ ok: boolean }>();
+  const isSaving = fetcher.state !== "idle";
+
+  return (
+    <fetcher.Form method="post">
+      <input type="hidden" name="intent" value="toggle-bookmark" />
+      <Button type="submit" variant="outline" size="sm" aria-pressed={bookmarked} disabled={isSaving}>
+        {bookmarked ? (
+          <BookmarkCheck className="mr-1.5 size-4" />
+        ) : (
+          <Bookmark className="mr-1.5 size-4" />
+        )}
+        {bookmarked ? "Bookmarked" : "Bookmark"}
+      </Button>
+    </fetcher.Form>
+  );
+}
+
+function LessonNote({ note }: { note: string }) {
+  const fetcher = useFetcher();
+  const isSaving = fetcher.state !== "idle";
+
+  return (
+    <Card className="mb-8">
+      <CardContent className="space-y-3 pt-6">
+        <div className="flex items-center gap-2">
+          <NotebookPen className="size-4 text-muted-foreground" />
+          <h2 className="font-semibold">Your notes</h2>
+        </div>
+
+        <fetcher.Form method="post" className="space-y-3">
+          <input type="hidden" name="intent" value="save-note" />
+          <Textarea
+            name="body"
+            rows={6}
+            maxLength={noteCharacterLimit}
+            defaultValue={note}
+            placeholder="Only you can read this."
+            className="resize-y"
+          />
+          <div className="flex items-center gap-3">
+            <Button type="submit" size="sm" disabled={isSaving}>
+              {isSaving ? "Saving..." : "Save note"}
+            </Button>
+          </div>
+        </fetcher.Form>
+      </CardContent>
+    </Card>
   );
 }
 

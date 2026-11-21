@@ -72,6 +72,8 @@ async function seed() {
 
   // Drop and recreate tables for a clean seed
   sqlite.exec(`
+    DROP TABLE IF EXISTS bookmarks;
+    DROP TABLE IF EXISTS notes;
     DROP TABLE IF EXISTS comments;
     DROP TABLE IF EXISTS course_ratings;
     DROP TABLE IF EXISTS video_watch_events;
@@ -1814,6 +1816,12 @@ This course is still in draft while the cluster examples are rewritten against t
     .run();
 
   console.log(`Created ${countRows(schema.enrollments)} enrollments.`);
+
+  const savedLesson = { userId: students[0].id, lessonId: course1LessonIds[7] };
+  db.insert(schema.bookmarks).values(savedLesson).run();
+  db.insert(schema.notes)
+    .values({ ...savedLesson, body: "Try rewriting the first example with a generic." })
+    .run();
 
   // ─── Course Ratings ───
   // Star ratings from enrolled students only. Not everyone rates.
