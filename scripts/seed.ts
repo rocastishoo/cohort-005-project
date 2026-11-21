@@ -1817,6 +1817,12 @@ This course is still in draft while the cluster examples are rewritten against t
 
   console.log(`Created ${countRows(schema.enrollments)} enrollments.`);
 
+  const savedLesson = { userId: students[0].id, lessonId: course1LessonIds[7] };
+  db.insert(schema.bookmarks).values(savedLesson).run();
+  db.insert(schema.notes)
+    .values({ ...savedLesson, body: "Try rewriting the first example with a generic." })
+    .run();
+
   // ─── Course Ratings ───
   // Star ratings from enrolled students only. Not everyone rates.
   // Course 1 averages 4.3 (4 ratings), course 2 averages 4.5 (2 ratings).
